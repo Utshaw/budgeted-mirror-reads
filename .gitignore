@@ -1,0 +1,5 @@
+/mirror
+/results/
+/data/
+__pycache__/
+*.dat
