@@ -2,7 +2,7 @@
 
 | Item | Configuration |
 | --- | --- |
-| Test date | November 15, 2026, America/Chicago |
+| Experiment date | November 15, 2026, America/Chicago |
 | Operating system | Ubuntu 24.04.5 LTS, native Linux 7.0.0-43-generic, x86-64 |
 | CPU | Intel Core i7-9700, eight logical CPUs available to all foreground and background runs |
 | Build | GCC 13.3, C++20, -O2, liburing 2.5 |
@@ -17,4 +17,4 @@
 | Main matrix | 116 and 231 arrivals/s, 3 s of arrivals per run, three repetitions, seed 720, 9,214 µs hedge delay, budgets 1/2/4, alternate outstanding threshold 1 |
 | Transition | A active before foreground time zero. B starts issuing around 1.5 s while A stays active. Actual first-issue timestamps and background counts are kept with the raw logs. |
 
-The two NTFS volumes were mounted with the desktop disk service using their existing filesystems. The test used fresh files inside dedicated directories. The file contents are reproducible with `tools.py prepare`. See [environment.json](environment.json) for exact files, hashes, and machine-readable settings. Drive behavior includes effects of this filesystem and shared controller.
+The two NTFS volumes were mounted with the desktop disk service using their existing filesystems. The experiment used fresh files inside dedicated directories. The file contents are reproducible with `tools.py prepare`. See [environment.json](environment.json) for exact files, hashes, and machine-readable settings. Drive behavior includes effects of this filesystem and shared controller.
