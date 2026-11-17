@@ -13,7 +13,8 @@ METRICS = ("p50_us", "p99_us", "useful_reads_per_sec", "duplicate_fraction",
 
 
 def key(row):
-    return int(row["depth"]), row["interference"], int(row["repeat"]), int(row["seed"])
+    return (int(row["depth"]), row["interference"], int(row["repeat"]), int(row["seed"]),
+            int(row.get("offered_reads_per_sec", 0)))
 
 
 def budget_config(row):
@@ -31,6 +32,9 @@ def compare(rows, output):
         require(int(row["failed_logical"]) == int(row["invalid_replicas"]) == 0,
                 f"unexpected read failure in {row['case']}")
 
+    metrics = METRICS + tuple(metric for metric in ("replicas_per_success", "alternate_wins",
+                                                     "peak_outstanding_losers")
+                              if metric in rows[0])
     comparisons = []
     for group in by_run.values():
         baseline = {r["mode"]: r for r in group if r["mode"] in ("round-robin", "less-busy")}
@@ -44,12 +48,15 @@ def compare(rows, output):
             for label, other in matches.items():
                 require(row["logical_reads"] == other["logical_reads"],
                         "matched runs used different logical read counts")
+                require(row.get("trace_sha256") == other.get("trace_sha256"),
+                        "matched runs used different arrival traces")
                 comparisons.append({
                     **{k: row[k] for k in ("depth", "interference", "repeat", "seed",
                                           "delay_us", "permit_limit", "threshold")},
+                    "offered_reads_per_sec": row.get("offered_reads_per_sec", ""),
                     "baseline": label,
-                    **{f"budget_{metric}": row[metric] for metric in METRICS},
-                    **{f"baseline_{metric}": other[metric] for metric in METRICS},
+                    **{f"budget_{metric}": row[metric] for metric in metrics},
+                    **{f"baseline_{metric}": other[metric] for metric in metrics},
                     "p99_delta_pct": delta(row["p99_us"], other["p99_us"]),
                     "throughput_delta_pct": delta(row["useful_reads_per_sec"],
                                                   other["useful_reads_per_sec"]),
@@ -66,9 +73,9 @@ def compare(rows, output):
 def describe(rows, by_run, comparisons):
     conditions = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        depth, noise, _, _ = key(row)
+        depth, noise, _, _, rate = key(row)
         config = (row["mode"], *budget_config(row))
-        conditions[depth, noise][config].append(row)
+        conditions[rate, depth, noise][config].append(row)
 
     n_reads = sum(int(r["logical_reads"]) for r in rows)
     cap_rows = [r for r in rows if r["mode"] == "budget"]
@@ -84,7 +91,7 @@ def describe(rows, by_run, comparisons):
         "with the lowest observed median p99 within that condition. Budget excludes the "
         "threshold-disabled ablation. The delay is in microseconds. Duplicate rates are "
         "duplicates divided by logical reads.", "",
-        "| Depth | Interference | Round-robin p99 µs | Less-busy p99 µs | "
+        "| Offered reads/s | Depth | Interference | Round-robin p99 µs | Less-busy p99 µs | "
         "Fixed p99 µs (delay, duplicates) | Budget p99 µs (delay, permits, duplicates) |",
         "|---:|---|---:|---:|---|---|",
     ]
@@ -92,7 +99,7 @@ def describe(rows, by_run, comparisons):
     def mid(runs, metric):
         return median(float(run[metric]) for run in runs)
 
-    for (depth, noise), groups in sorted(conditions.items()):
+    for (rate, depth, noise), groups in sorted(conditions.items()):
         fixed_cfg, fixed = min(((c, g) for c, g in groups.items() if c[0] == "fixed"),
                                key=lambda item: mid(item[1], "p99_us"))
         budget_cfg, budget = min(((c, g) for c, g in groups.items()
@@ -101,7 +108,7 @@ def describe(rows, by_run, comparisons):
         rr = mid(groups[("round-robin", 0, 0, 0)], "p99_us")
         lb = mid(groups[("less-busy", 0, 0, 0)], "p99_us")
         lines.append(
-            f"| {depth} | {noise} | {rr:.1f} | {lb:.1f} | "
+            f"| {rate or 'closed loop'} | {depth} | {noise} | {rr:.1f} | {lb:.1f} | "
             f"{mid(fixed, 'p99_us'):.1f} ({fixed_cfg[1]}, "
             f"{mid(fixed, 'duplicate_fraction'):.1%}) | "
             f"{mid(budget, 'p99_us'):.1f} ({budget_cfg[1]}, "
@@ -139,11 +146,11 @@ def describe(rows, by_run, comparisons):
         lines += ["", "## Alternate-drive threshold ablation", "",
                   "The permit limit and delay are held fixed. Values compare threshold off "
                   "with threshold on within each repetition.", "",
-                  "| Depth | Interference | Repeat | p99 delta | Duplicates on | Duplicates off |",
-                  "|---:|---|---:|---:|---:|---:|"]
+                  "| Depth | Interference | Repeat | Permits | p99 delta | Duplicates on | Duplicates off |",
+                  "|---:|---|---:|---:|---:|---:|---:|"]
         for off, on in ablation:
             lines.append(f"| {off['depth']} | {off['interference']} | {int(off['repeat']) + 1} | "
-                         f"{delta(off['p99_us'], on['p99_us']):+.1f}% | "
+                         f"{off['permit_limit']} | {delta(off['p99_us'], on['p99_us']):+.1f}% | "
                          f"{float(on['duplicate_fraction']):.1%} | {float(off['duplicate_fraction']):.1%} |")
 
     lines += ["", "See summary.csv for p50, p99, throughput, replica counts and bytes, "

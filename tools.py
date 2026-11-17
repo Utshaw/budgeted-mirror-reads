@@ -69,7 +69,8 @@ def summarize(prefix):
     for row in replicas:
         grouped[row["id"]].append(row)
     require(logical and len(grouped) == len(logical), "logical/replica ID mismatch")
-    latencies, cleanup = [], []
+    latencies, cleanup, loser_events = [], [], []
+    alternate_wins = 0
     duplicates = 0
     for expected_id, row in enumerate(logical):
         require(row["id"] == expected_id, "missing or repeated logical ID")
@@ -96,11 +97,19 @@ def summarize(prefix):
             latencies.append((row["end_ns"] - row["start_ns"]) / 1000)
             if len(copies) == 2:
                 cleanup.append((drained - row["end_ns"]) / 1000)
+                alternate_wins += winners[0]["attempt"] == 2
+                if drained > row["end_ns"]:
+                    loser_events.extend(((row["end_ns"], 1), (drained, -1)))
         else:
             require(not winners and not valid and row["end_ns"] == drained,
                     "failed logical read finished before all attempts failed")
         require(not row["permit"] or len(copies) == 2, "permit without a duplicate")
         duplicates += len(copies) - 1
+
+    active_losers = peak_losers = 0
+    for _, change in sorted(loser_events):
+        active_losers += change
+        peak_losers = max(peak_losers, active_losers)
 
     # The denominator includes the time spent draining the last duplicates.
     duration = (max(row["drained_ns"] for row in logical) - logical[0]["start_ns"]) / 1e9
@@ -114,14 +123,19 @@ def summarize(prefix):
         "replica_reads": len(replicas),
         "replica_bytes": sum(max(0, row["result"]) for row in replicas),
         "duplicate_fraction": duplicates / len(logical),
+        "replicas_per_success": len(replicas) / len(latencies) if latencies else math.nan,
+        "alternate_wins": alternate_wins,
+        "peak_outstanding_losers": peak_losers,
         "peak_active_permits": max(row["permits_at_submit"] for row in replicas),
         "cleanup_p99_us": percentile(cleanup, .99),
     }
 
 
-def run(binary, a, b, prefix, mode, count, depth, delay, permits, threshold, seed):
+def run(binary, a, b, prefix, mode, count, depth, delay, permits, threshold, seed, rate=0):
     cmd = [str(binary.resolve()), str(a), str(b), mode, str(count), str(depth),
            str(delay), str(permits), str(threshold), str(seed), str(prefix)]
+    if rate:
+        cmd.append(str(rate))
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
 
 
@@ -175,8 +189,9 @@ def smoke(binary):
         result = summarize(prefix)
         require(result["failed_logical"] == 32 and result["replica_reads"] == 64,
                 "both-invalid requests did not drain")
-        last = read_rows(Path(f"{prefix}-replica.csv"))[-1]
-        require(last["permits_after_completion"] == 0, "permit was not released")
+        completions = read_rows(Path(f"{prefix}-replica.csv"))
+        require([row["permits_after_completion"] for row in completions] == [1, 0] * 32,
+                "the permit must remain held until the second completion")
 
         a.write_bytes(bytes(BLOCK))
         b.write_bytes(bytes(BLOCK))
@@ -188,7 +203,24 @@ def smoke(binary):
         result = summarize(prefix)
         require(0 < result["logical_reads"] < 1000000 and result["failed_logical"] == 0,
                 "interrupted run failed to drain cleanly")
-    print("Smoke tests passed for all policies, failure cases, and shutdown.")
+        # Truncation is fault injection on temporary data, after the files passed startup checks.
+        prefix = root / "paced-short-read"
+        with run(binary, a, b, prefix, "disk-a", 32, 4, 0, 0, 0, 720, rate=100) as process:
+            require(process.stdout.readline().startswith("Origin monotonic ns: "),
+                    "paced reader failed to start")
+            time.sleep(.05)
+            a.write_bytes(b"")
+            finished(process, expected=2)
+        result = summarize(prefix)
+        rows = read_rows(Path(f"{prefix}-logical.csv"))
+        require(len(rows) == 32 and 0 < result["failed_logical"] <= 32, "short read did not fail")
+        require(all(row["start_ns"] == i * 10_000_000 and
+                    row["admitted_ns"] >= row["start_ns"] for i, row in enumerate(rows)),
+                "paced starts or admissions do not match the arrival trace")
+        require(any(row["result"] == 0 and not row["valid"]
+                    for row in read_rows(Path(f"{prefix}-replica.csv"))),
+                "short read completion was not logged")
+    print("Smoke tests passed for all policies, paced arrivals, failure cases, and shutdown.")
 
 
 @contextmanager
@@ -304,10 +336,11 @@ def plot(summary, output):
             label += f" {row['delay_us']} µs"
         if row["mode"] == "budget":
             label += f", permits {row['permit_limit']}, threshold {row['threshold']}"
-        groups[(int(row["depth"]), row["interference"])][label].append(row)
+        rate = int(row.get("offered_reads_per_sec", 0))
+        groups[(rate, int(row["depth"]), row["interference"])][label].append(row)
     require(bool(groups), "summary has no measurements")
     output.mkdir(parents=True, exist_ok=True)
-    for (depth, scenario), policies in groups.items():
+    for (rate, depth, scenario), policies in groups.items():
         fig, axes = plt.subplots(1, 2, figsize=(12, max(3, .37 * len(policies) + 1)))
         for axis, (metric, title) in zip(axes, metrics):
             axis.barh(list(policies), [median(float(r[metric]) for r in group)
@@ -315,10 +348,93 @@ def plot(summary, output):
             axis.invert_yaxis()
             axis.set_xlabel(title)
         axes[1].tick_params(labelleft=False)
-        fig.suptitle(f"Depth {depth}, interference {scenario} (median across runs)")
+        load = f"{rate} offered reads/s" if rate else f"Depth {depth}"
+        fig.suptitle(f"{load}, interference {scenario} (median across runs)")
         fig.tight_layout()
-        fig.savefig(output / f"depth-{depth}-{scenario}.png", dpi=180)
+        label = f"rate-{rate}" if rate else f"depth-{depth}"
+        fig.savefig(output / f"{label}-{scenario}.png", dpi=180)
         plt.close(fig)
+
+
+    if "replicas_per_success" in rows[0]:
+        tradeoff_plot(groups, output, plt)
+    phases = summary.parent / "transition-phases.csv"
+    if phases.is_file():
+        transition_plot(rows, phases, output, plt)
+
+
+def tradeoff_plot(groups, output, plt):
+    no_noise = [(rate, depth, policies) for (rate, depth, case), policies in groups.items()
+                if case == "none"]
+    if not no_noise:
+        return
+    fig, axes = plt.subplots(1, len(no_noise), figsize=(5.8 * len(no_noise), 4.4),
+                             squeeze=False)
+    colors = {"round-robin": "#575d65", "less-busy": "#25842b",
+              "fixed": "#c24a25", "budget": "#2b5aaa"}
+    markers = {"round-robin": "s", "less-busy": "D", "fixed": "^", "budget": "o"}
+    legend = {}
+    for axis, (rate, depth, policies) in zip(axes[0], no_noise):
+        for label, group in policies.items():
+            mode = group[0]["mode"]
+            x = [float(r["replicas_per_success"]) for r in group]
+            y = [float(r["p99_us"]) / 1000 for r in group]
+            axis.scatter(x, y, color=colors[mode], marker=markers[mode], alpha=.24)
+            legend[mode] = axis.scatter(median(x), median(y), color=colors[mode],
+                                        marker=markers[mode], s=55, label=mode)
+        axis.set_title(f"{rate} offered reads/s" if rate else f"Depth {depth}")
+        axis.set_xlabel("Replica reads per successful logical read")
+        axis.set_ylabel("Logical p99 latency (ms)")
+        axis.grid(alpha=.22)
+    fig.legend(list(legend.values()), list(legend), loc="lower center", ncol=4)
+    fig.suptitle("Tail latency and replica I/O without interference")
+    fig.tight_layout(rect=(0, .09, 1, .95))
+    fig.savefig(output / "p99-versus-replica-reads.png", dpi=180)
+    plt.close(fig)
+
+
+def transition_plot(runs, phases, output, plt):
+    budget = {row["case"]: row for row in runs
+              if row["interference"] == "transition" and row["mode"] == "budget"}
+    if not budget:
+        return
+    groups = defaultdict(list)
+    with phases.open(newline="") as stream:
+        for phase in csv.DictReader(stream):
+            run = budget.get(phase["case"])
+            if run:
+                key = (phase["phase_at_arrival"], int(run["permit_limit"]), int(run["threshold"]))
+                groups[key].append(phase)
+
+    permits = sorted({cap for _, cap, _ in groups})
+    thresholds = sorted({threshold for _, _, threshold in groups}, reverse=True)
+    fig, axes = plt.subplots(2, 2, figsize=(9.3, 6.7), sharex=True)
+    for column, (phase, title) in enumerate((("a", "A under interference"),
+                                             ("both", "Both drives under interference"))):
+        axes[0, column].set_title(title)
+        for row, (metric, label, scale) in enumerate((
+            ("p99_us", "Logical p99 latency (ms)", 1000),
+            ("replicas_per_success", "Replica reads per success", 1),
+        )):
+            axis = axes[row, column]
+            for threshold in thresholds:
+                samples = [groups[phase, cap, threshold] for cap in permits]
+                values = [median(float(item[metric]) for item in group) / scale
+                          for group in samples]
+                style = {"color": "#295b97", "linestyle": "-"} if threshold else {
+                    "color": "#ad4f25", "linestyle": "--"}
+                axis.plot(permits, values, marker="o", label=f"Threshold {threshold or 'off'}",
+                          **style)
+            axis.set_ylabel(label)
+            axis.grid(alpha=.22)
+            axis.set_xticks(permits)
+        axes[1, column].set_xlabel("Pair permits")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=2)
+    fig.suptitle("Threshold effect during the interference transition")
+    fig.tight_layout(rect=(0, .08, 1, .95))
+    fig.savefig(output / "transition-threshold.png", dpi=180)
+    plt.close(fig)
 
 
 def main():

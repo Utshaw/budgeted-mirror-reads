@@ -1,5 +1,6 @@
 /mirror
-/results/
+/results/*
+!/results/milestone-3-linux/
 /data/
 __pycache__/
 *.dat

@@ -17,6 +17,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 constexpr unsigned block_size = 4096;
@@ -52,12 +53,14 @@ struct File {
     ~File() { close(fd); }
 };
 
-enum class Policy { round_robin, less_busy, fixed, budget };
+enum class Policy { round_robin, less_busy, fixed, budget, disk_a, disk_b };
 Policy parse_policy(const std::string& name) {
     if (name == "round-robin") return Policy::round_robin;
     if (name == "less-busy") return Policy::less_busy;
     if (name == "fixed") return Policy::fixed;
     if (name == "budget") return Policy::budget;
+    if (name == "disk-a") return Policy::disk_a;
+    if (name == "disk-b") return Policy::disk_b;
     throw std::runtime_error("Unknown policy: " + name);
 }
 
@@ -65,6 +68,7 @@ struct Request {
     unsigned id;
     uint64_t block;
     int64_t start;
+    int64_t admitted;
     int64_t logical_end = -1;
     int64_t drained = -1;
     unsigned original;
@@ -95,13 +99,14 @@ class Run {
     std::array<int, 2> files;
     uint64_t blocks;
     Policy policy;
-    unsigned count, depth, delay_us, budget, threshold;
+    unsigned count, depth, delay_us, budget, threshold, rate;
     std::mt19937_64 rng;
     std::vector<Request> requests;
     std::vector<Completion> completions;
     std::list<Request*> waiting;
     std::vector<std::unique_ptr<Replica>> in_flight;
     std::array<unsigned, 2> outstanding{};
+    unsigned next_tie = 0;
     unsigned permits = 0;
     unsigned errors = 0;
     uint64_t bytes_read = 0;
@@ -112,9 +117,24 @@ class Run {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - origin).count();
     }
 
-    unsigned choose_disk(unsigned id) const {
-        if (policy == Policy::round_robin || outstanding[0] == outstanding[1]) return id % 2;
+    unsigned choose_disk(unsigned id) {
+        if (policy == Policy::disk_a) return 0;
+        if (policy == Policy::disk_b) return 1;
+        if (policy == Policy::round_robin) return id % 2;
+        if (outstanding[0] == outstanding[1]) {
+            const auto selected = next_tie;
+            next_tie = 1 - next_tie;
+            return selected;
+        }
         return outstanding[0] < outstanding[1] ? 0 : 1;
+    }
+
+    int64_t arrival(size_t id) const {
+        return rate ? static_cast<int64_t>(id) * 1000000000 / rate : 0;
+    }
+
+    bool can_admit() const {
+        return !stop_requested && requests.size() < count && waiting.size() < depth && room();
     }
 
     bool room() const { return in_flight.size() < 4 * depth; }
@@ -194,7 +214,7 @@ class Run {
             if (policy == Policy::budget &&
                 (permits >= budget || (threshold != 0 && outstanding[alternate] >= threshold)))
                 continue;
-            const auto due = request->start + 1000LL * delay_us;
+            const auto due = request->admitted + 1000LL * delay_us;
             if (now() < due) {
                 if (next_due < 0) next_due = due;
                 continue;
@@ -213,10 +233,10 @@ class Run {
 
 public:
     Run(const File& a, const File& b, Policy strategy, unsigned operations, unsigned concurrency,
-        unsigned delay, unsigned limit, unsigned alternate_limit, unsigned seed)
+        unsigned delay, unsigned limit, unsigned alternate_limit, unsigned seed, unsigned offered_rate)
         : files{a.fd,b.fd}, blocks(a.info.st_size / block_size), policy(strategy),
           count(operations), depth(concurrency), delay_us(delay), budget(limit),
-          threshold(alternate_limit), rng(seed) {
+          threshold(alternate_limit), rate(offered_rate), rng(seed) {
         requests.reserve(count);
         completions.reserve(2 * count);
         in_flight.reserve(4 * depth);
@@ -227,15 +247,20 @@ public:
     void execute() {
         std::uniform_int_distribution<uint64_t> pick(0, blocks - 1);
         origin = Clock::now();
+        std::cout << "Origin monotonic ns: "
+                  << std::chrono::duration_cast<std::chrono::nanoseconds>(origin.time_since_epoch()).count()
+                  << std::endl;
         for (;;) {
             reap();
             if ((stop_requested || requests.size() == count) && in_flight.empty()) break;
             // Give overdue hedges first access to newly freed physical slots.
             auto due = schedule();
-            while (!stop_requested && waiting.size() < depth && requests.size() < count && room()) {
+            while (can_admit() && arrival(requests.size()) <= now()) {
                 unsigned id = static_cast<unsigned>(requests.size());
-                requests.push_back(Request{.id = id, .block = pick(rng), .start = now(),
-                                           .original = choose_disk(id)});
+                const auto admitted = now();
+                requests.push_back(Request{.id = id, .block = pick(rng),
+                                           .start = rate ? arrival(id) : admitted,
+                                           .admitted = admitted, .original = choose_disk(id)});
                 auto& request = requests.back();
                 waiting.push_back(&request);
                 submit(request, request.original);
@@ -250,10 +275,18 @@ public:
                 check(submitted, "io_uring_submit");
             } while (submitted == -EINTR || io_uring_sq_ready(&ring));
 
-            if (in_flight.empty()) continue;
+            if (rate && can_admit()) {
+                const auto next_arrival = arrival(requests.size());
+                if (due < 0 || next_arrival < due) due = next_arrival;
+            }
+            if (in_flight.empty()) {
+                if (due >= 0)
+                    std::this_thread::sleep_until(origin + std::chrono::nanoseconds(due));
+                continue;
+            }
             io_uring_cqe* cqe;
             int result;
-            if (due >= 0 && room()) {
+            if (due >= 0) {
                 const auto remaining = due - now();
                 if (remaining <= 0) continue;
                 __kernel_timespec timeout{remaining / 1000000000, remaining % 1000000000};
@@ -273,12 +306,12 @@ public:
         std::ofstream replica(prefix + "-replica.csv");
         logical.exceptions(std::ios::failbit | std::ios::badbit);
         replica.exceptions(std::ios::failbit | std::ios::badbit);
-        logical << "id,offset,start_ns,end_ns,drained_ns,winner,issued,permit\n";
+        logical << "id,offset,start_ns,end_ns,drained_ns,winner,issued,permit,admitted_ns\n";
         replica << "id,attempt,disk,start_ns,end_ns,result,valid,winner,permits_at_submit,permits_after_completion\n";
         for (const auto& r : requests)
             logical << r.id << ',' << r.block * block_size << ',' << r.start << ','
                     << r.logical_end << ',' << r.drained << ',' << r.winner << ','
-                    << r.issued << ',' << r.permit << '\n';
+                    << r.issued << ',' << r.permit << ',' << r.admitted << '\n';
         for (const auto& c : completions)
             replica << c.request_id << ',' << c.attempt << ',' << c.disk << ','
                     << c.start << ',' << c.done << ',' << c.result << ',' << c.valid << ','
@@ -294,8 +327,8 @@ public:
 };
 
 int main(int argc, char** argv) {
-    if (argc != 11) {
-        std::cerr << "Usage: mirror A B MODE COUNT DEPTH DELAY_US PERMITS THRESHOLD SEED LOG_PREFIX\n"
+    if (argc != 11 && argc != 12) {
+        std::cerr << "Usage: mirror A B MODE COUNT DEPTH DELAY_US PERMITS THRESHOLD SEED LOG_PREFIX [OFFERED_READS_PER_SECOND]\n"
                   << "MODE: round-robin, less-busy, fixed, budget. THRESHOLD=0 disables the threshold.\n";
         return 1;
     }
@@ -310,7 +343,7 @@ int main(int argc, char** argv) {
         Run run(a, b, parse_policy(argv[3]), number(argv[4], 1, 1000000),
                 number(argv[5], 1, 1024), number(argv[6], 0, 10000000),
                 number(argv[7], 0, 4096), number(argv[8], 0, 4096),
-                number(argv[9], 0, UINT32_MAX));
+                number(argv[9], 0, UINT32_MAX), argc == 12 ? number(argv[11], 1, 1000000) : 0);
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
         run.execute();
