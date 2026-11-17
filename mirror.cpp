@@ -1,3 +1,5 @@
+#include "policies/policy.h"
+
 #include <liburing.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -21,6 +23,7 @@
 #include <vector>
 
 constexpr unsigned block_size = 4096;
+constexpr int64_t no_deadline = -1;
 using Clock = std::chrono::steady_clock;
 volatile std::sig_atomic_t stop_requested = 0;
 void stop(int) { stop_requested = 1; }
@@ -52,17 +55,6 @@ struct File {
     }
     ~File() { close(fd); }
 };
-
-enum class Policy { round_robin, less_busy, fixed, budget, disk_a, disk_b };
-Policy parse_policy(const std::string& name) {
-    if (name == "round-robin") return Policy::round_robin;
-    if (name == "less-busy") return Policy::less_busy;
-    if (name == "fixed") return Policy::fixed;
-    if (name == "budget") return Policy::budget;
-    if (name == "disk-a") return Policy::disk_a;
-    if (name == "disk-b") return Policy::disk_b;
-    throw std::runtime_error("Unknown policy: " + name);
-}
 
 struct Request {
     unsigned id;
@@ -98,15 +90,14 @@ struct Completion {
 class Run {
     std::array<int, 2> files;
     uint64_t blocks;
-    Policy policy;
-    unsigned count, depth, delay_us, budget, threshold, rate;
+    mirror::ReadPolicy& policy;
+    unsigned count, depth, delay_us, rate;
     std::mt19937_64 rng;
     std::vector<Request> requests;
     std::vector<Completion> completions;
     std::list<Request*> waiting;
     std::vector<std::unique_ptr<Replica>> in_flight;
-    std::array<unsigned, 2> outstanding{};
-    unsigned next_tie = 0;
+    mirror::OutstandingReads outstanding{};
     unsigned permits = 0;
     unsigned errors = 0;
     uint64_t bytes_read = 0;
@@ -117,29 +108,17 @@ class Run {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - origin).count();
     }
 
-    unsigned choose_disk(unsigned id) {
-        if (policy == Policy::disk_a) return 0;
-        if (policy == Policy::disk_b) return 1;
-        if (policy == Policy::round_robin) return id % 2;
-        if (outstanding[0] == outstanding[1]) {
-            const auto selected = next_tie;
-            next_tie = 1 - next_tie;
-            return selected;
-        }
-        return outstanding[0] < outstanding[1] ? 0 : 1;
-    }
-
     int64_t arrival(size_t id) const {
         return rate ? static_cast<int64_t>(id) * 1000000000 / rate : 0;
     }
 
     bool can_admit() const {
-        return !stop_requested && requests.size() < count && waiting.size() < depth && room();
+        return !stop_requested && requests.size() < count && waiting.size() < depth && has_replica_slot();
     }
 
-    bool room() const { return in_flight.size() < 4 * depth; }
+    bool has_replica_slot() const { return in_flight.size() < 4 * depth; }
 
-    void submit(Request& request, unsigned disk) {
+    void queue_read(Request& request, unsigned disk) {
         auto* sqe = io_uring_get_sqe(&ring);
         if (!sqe) throw std::runtime_error("Submission ring is full");
         auto replica = std::make_unique<Replica>();
@@ -183,6 +162,7 @@ class Run {
             request.logical_end = done;
             if (!winner) ++errors;
         }
+        // A hedge permit covers both reads, including any loser still in flight.
         if (request.pending == 0) {
             request.drained = done;
             if (request.permit) --permits;
@@ -198,22 +178,22 @@ class Run {
         }
     }
 
-    void reap() {
+    void reap_completions() {
         io_uring_cqe* cqe;
         while (io_uring_peek_cqe(&ring, &cqe) == 0) complete(cqe);
         waiting.remove_if([](const Request* request) { return request->logical_end >= 0; });
     }
 
-    int64_t schedule() {
-        int64_t next_due = -1;
-        if (stop_requested || (policy != Policy::fixed && policy != Policy::budget)) return next_due;
+    int64_t schedule_hedges() {
+        if (stop_requested || !policy.hedges()) return no_deadline;
+
+        int64_t next_due = no_deadline;
         for (auto* request : waiting) {
-            if (!room()) break;
+            if (!has_replica_slot()) break;
             if (request->issued == 2) continue;
             const unsigned alternate = 1 - request->original;
-            if (policy == Policy::budget &&
-                (permits >= budget || (threshold != 0 && outstanding[alternate] >= threshold)))
-                continue;
+            const auto hedge = policy.hedge(permits, outstanding[alternate]);
+            if (hedge == mirror::Hedge::none) continue;
             const auto due = request->admitted + 1000LL * delay_us;
             if (now() < due) {
                 if (next_due < 0) next_due = due;
@@ -222,21 +202,72 @@ class Run {
             // A visible completion takes precedence over a due hedge.
             io_uring_cqe* ready;
             if (io_uring_peek_cqe(&ring, &ready) == 0) return now();
-            if (policy == Policy::budget) {
+            if (hedge == mirror::Hedge::permit) {
                 ++permits;
                 request->permit = true;
             }
-            submit(*request, alternate);
+            queue_read(*request, alternate);
         }
         return next_due;
     }
 
+    void admit_reads(std::uniform_int_distribution<uint64_t>& pick_block) {
+        while (can_admit() && arrival(requests.size()) <= now()) {
+            const auto id = static_cast<unsigned>(requests.size());
+            const auto admitted = now();
+            requests.push_back({
+                .id = id,
+                .block = pick_block(rng),
+                .start = rate ? arrival(id) : admitted,
+                .admitted = admitted,
+                .original = policy.choose_primary(id, outstanding),
+            });
+            auto& request = requests.back();
+            waiting.push_back(&request);
+            queue_read(request, request.original);
+        }
+    }
+
+    void submit_queued_reads() {
+        for (;;) {
+            const int submitted = io_uring_submit(&ring);
+            if (submitted == -EINTR) continue;
+            check(submitted, "io_uring_submit");
+            if (!io_uring_sq_ready(&ring)) return;
+        }
+    }
+
+    void wait_for_work(int64_t wake_at) {
+        if (in_flight.empty()) {
+            if (wake_at >= 0)
+                std::this_thread::sleep_until(origin + std::chrono::nanoseconds(wake_at));
+            return;
+        }
+
+        io_uring_cqe* completion;
+        int result;
+        if (wake_at >= 0) {
+            const auto remaining = wake_at - now();
+            if (remaining <= 0) return;
+
+            __kernel_timespec timeout{remaining / 1000000000, remaining % 1000000000};
+            result = io_uring_wait_cqe_timeout(&ring, &completion, &timeout);
+            if (result == -ETIME) return;
+        } else {
+            result = io_uring_wait_cqe(&ring, &completion);
+        }
+        if (result == -EINTR) return;
+
+        check(result, "waiting for completions");
+        complete(completion);
+    }
+
 public:
-    Run(const File& a, const File& b, Policy strategy, unsigned operations, unsigned concurrency,
-        unsigned delay, unsigned limit, unsigned alternate_limit, unsigned seed, unsigned offered_rate)
+    Run(const File& a, const File& b, mirror::ReadPolicy& strategy, unsigned operations,
+        unsigned concurrency, unsigned delay, unsigned seed, unsigned offered_rate)
         : files{a.fd,b.fd}, blocks(a.info.st_size / block_size), policy(strategy),
-          count(operations), depth(concurrency), delay_us(delay), budget(limit),
-          threshold(alternate_limit), rate(offered_rate), rng(seed) {
+          count(operations), depth(concurrency), delay_us(delay), rate(offered_rate), rng(seed) {
+        // Each in-flight replica points into requests, so its storage must stay put.
         requests.reserve(count);
         completions.reserve(2 * count);
         in_flight.reserve(4 * depth);
@@ -245,59 +276,31 @@ public:
     ~Run() { io_uring_queue_exit(&ring); }
 
     void execute() {
-        std::uniform_int_distribution<uint64_t> pick(0, blocks - 1);
+        std::uniform_int_distribution<uint64_t> pick_block(0, blocks - 1);
         origin = Clock::now();
-        std::cout << "Origin monotonic ns: "
-                  << std::chrono::duration_cast<std::chrono::nanoseconds>(origin.time_since_epoch()).count()
-                  << std::endl;
+        const auto origin_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            origin.time_since_epoch()).count();
+        std::cout << "Origin monotonic ns: " << origin_ns << std::endl;
+
         for (;;) {
-            reap();
+            reap_completions();
             if ((stop_requested || requests.size() == count) && in_flight.empty()) break;
-            // Give overdue hedges first access to newly freed physical slots.
-            auto due = schedule();
-            while (can_admit() && arrival(requests.size()) <= now()) {
-                unsigned id = static_cast<unsigned>(requests.size());
-                const auto admitted = now();
-                requests.push_back(Request{.id = id, .block = pick(rng),
-                                           .start = rate ? arrival(id) : admitted,
-                                           .admitted = admitted, .original = choose_disk(id)});
-                auto& request = requests.back();
-                waiting.push_back(&request);
-                submit(request, request.original);
-            }
-            // Schedule newly admitted requests too, including a zero hedge delay.
-            const auto new_due = schedule();
-            if (new_due >= 0 && (due < 0 || new_due < due)) due = new_due;
-            int submitted;
-            do {
-                submitted = io_uring_submit(&ring);
-                if (submitted == -EINTR) continue;
-                check(submitted, "io_uring_submit");
-            } while (submitted == -EINTR || io_uring_sq_ready(&ring));
+
+            // Give overdue hedges first access to newly freed replica slots.
+            auto wake_at = schedule_hedges();
+            admit_reads(pick_block);
+            // Newly admitted reads can have a zero hedge delay.
+            const auto new_hedge_due = schedule_hedges();
+            if (new_hedge_due >= 0 && (wake_at < 0 || new_hedge_due < wake_at))
+                wake_at = new_hedge_due;
+
+            submit_queued_reads();
 
             if (rate && can_admit()) {
                 const auto next_arrival = arrival(requests.size());
-                if (due < 0 || next_arrival < due) due = next_arrival;
+                if (wake_at < 0 || next_arrival < wake_at) wake_at = next_arrival;
             }
-            if (in_flight.empty()) {
-                if (due >= 0)
-                    std::this_thread::sleep_until(origin + std::chrono::nanoseconds(due));
-                continue;
-            }
-            io_uring_cqe* cqe;
-            int result;
-            if (due >= 0) {
-                const auto remaining = due - now();
-                if (remaining <= 0) continue;
-                __kernel_timespec timeout{remaining / 1000000000, remaining % 1000000000};
-                result = io_uring_wait_cqe_timeout(&ring, &cqe, &timeout);
-                if (result == -ETIME) continue;
-            } else {
-                result = io_uring_wait_cqe(&ring, &cqe);
-            }
-            if (result == -EINTR) continue;
-            check(result, "waiting for completions");
-            complete(cqe);
+            wait_for_work(wake_at);
         }
     }
 
@@ -340,9 +343,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Replica files must be nonempty regular files of equal, aligned size");
         if (a.info.st_dev == b.info.st_dev && a.info.st_ino == b.info.st_ino)
             throw std::runtime_error("Use two distinct replica files");
-        Run run(a, b, parse_policy(argv[3]), number(argv[4], 1, 1000000),
+        auto policy = mirror::make_policy(argv[3], number(argv[7], 0, 4096),
+                                          number(argv[8], 0, 4096));
+        Run run(a, b, *policy, number(argv[4], 1, 1000000),
                 number(argv[5], 1, 1024), number(argv[6], 0, 10000000),
-                number(argv[7], 0, 4096), number(argv[8], 0, 4096),
                 number(argv[9], 0, UINT32_MAX), argc == 12 ? number(argv[11], 1, 1000000) : 0);
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
