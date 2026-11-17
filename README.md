@@ -68,9 +68,24 @@ The WSL-oriented `tools.py experiment` runner remains available for a closed-loo
 
 See [results/milestone-3-linux](results/milestone-3-linux/) for the collected run, including the study report, environment notes, calibration, CSV tables, plots, and raw logs.
 
-## WSL Milestone 3 results
+## WSL2 Milestone 3 results
 
-The original WSL2 README points to local results in `results/milestone-3-wsl`.
+The [WSL2 report and native Linux comparison](results/milestone-3-wsl2-v2/report.md) uses the same calibration, policy matrix, transition timing, analysis, and result layout as the native study. The WSL2 runner maps each Windows drive letter to its host SATA disk through PowerShell. Use two distinct host disks, one replica and one noise file per disk, and a fresh output directory on the WSL filesystem.
+
+From the repository root in WSL2, after building and testing:
+
+```sh
+a=$(mktemp -d /mnt/d/mirror-reads.XXXXXX)
+b=$(mktemp -d /mnt/e/mirror-reads.XXXXXX)
+out=$(mktemp -d)/milestone-3-wsl2-v2
+python3 tools.py prepare "$a/mirror.dat" "$b/mirror.dat" --mib 512
+python3 tools.py prepare "$a/noise.dat" "$b/noise.dat" --mib 512
+python3 linux_experiment.py --wsl2 "$a/mirror.dat" "$b/mirror.dat" \
+    "$a/noise.dat" "$b/noise.dat" "$out"
+python3 analyze.py "$out/summary.csv"
+python3 tools.py plot "$out/summary.csv" "$out/plots"
+python3 replay_linux_cases.py results/milestone-3-linux "$out"
+```
 
 ## Transfer to native Linux
 

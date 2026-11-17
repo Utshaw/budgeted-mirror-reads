@@ -10,6 +10,7 @@ import mmap
 import os
 from pathlib import Path
 import random
+import re
 import signal
 import subprocess
 import threading
@@ -22,8 +23,20 @@ def shell(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
-def storage(path):
+def storage(path, wsl2=False):
     source = shell("findmnt", "-n", "-o", "SOURCE", "--target", str(path))
+    if wsl2:
+        match = re.fullmatch(r"([A-Za-z]):\\", source)
+        require(match is not None, f"expected a Windows drive mount for {path}: {source}")
+        letter = match.group(1).upper()
+        disk = json.loads(shell("powershell.exe", "-NoProfile", "-Command",
+                                f"$ErrorActionPreference='Stop'; Get-Partition -DriveLetter {letter} "
+                                "| Get-Disk | Select-Object Number,FriendlyName,BusType "
+                                "| ConvertTo-Json -Compress"))
+        require(disk["BusType"] == "SATA", f"expected a SATA disk for {path}: {disk}")
+        return {"source": source, "parent": disk["Number"], "drive": disk["FriendlyName"],
+                "bus": disk["BusType"],
+                "filesystem": shell("findmnt", "-n", "-o", "FSTYPE", "--target", str(path))}
     parent = shell("lsblk", "-n", "-d", "-o", "PKNAME", source)
     require(bool(parent), f"cannot identify a physical parent for {path}")
     drive = shell("lsblk", "-d", "-n", "-o", "TYPE,ROTA,MODEL,TRAN", f"/dev/{parent}")
@@ -196,7 +209,9 @@ def phase_rows(prefix, transition, case):
 
 
 def experiment(args):
-    drives = [storage(path) for path in (args.a, args.b)]
+    if args.wsl2:
+        require("wsl2" in shell("uname", "-r").lower(), "--wsl2 requires a WSL2 kernel")
+    drives = [storage(path, args.wsl2) for path in (args.a, args.b)]
     require(drives[0]["parent"] != drives[1]["parent"], "replicas share a physical parent")
     files = (args.a, args.b, args.noise_a, args.noise_b)
     require(len({(p.stat().st_dev, p.stat().st_ino) for p in files}) == 4,
@@ -263,7 +278,7 @@ def experiment(args):
                         require(metrics["peak_active_permits"] <= cap, f"permit overrun: {case}")
                     if transition is not None:
                         transition_rows.extend(phase_rows(prefix, transition, case))
-                    row = {"case": case, "environment": "native-linux", "mode": mode,
+                    row = {"case": case, "environment": "wsl2" if args.wsl2 else "native-linux", "mode": mode,
                            "depth": args.depth, "interference": scenario, "repeat": repeat,
                            "seed": args.seed, "delay_us": hedge_delay, "permit_limit": cap,
                            "threshold": threshold, "offered_reads_per_sec": rate,
@@ -288,6 +303,8 @@ def main():
     parser.add_argument("--permits", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--threshold", type=int, default=1)
     parser.add_argument("--seed", type=int, default=720)
+    parser.add_argument("--wsl2", action="store_true",
+                        help="resolve Windows-mounted SATA drives through the host under WSL2")
     args = parser.parse_args()
     if (args.seconds < 1 or not 1 <= args.depth <= 1024 or args.noise_depth < 1
             or args.repeats < 3 or len(set(args.permits)) not in (2, 3)

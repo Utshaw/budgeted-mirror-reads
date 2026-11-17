@@ -1,0 +1,36 @@
+{
+  "origin_monotonic_ns": 699711330488,
+  "transition_ns": null,
+  "background": [
+    {
+      "file": "/mnt/d/mirror-reads-wsl2-v2/noise.dat",
+      "workers": [
+        {
+          "first_issue_ns": 699504031148,
+          "reads": 12164,
+          "end_ns": 702734196955
+        },
+        {
+          "first_issue_ns": 699504060449,
+          "reads": 12177,
+          "end_ns": 702734160453
+        }
+      ]
+    },
+    {
+      "file": "/mnt/e/mirror-reads-wsl2-v2/noise.dat",
+      "workers": [
+        {
+          "first_issue_ns": 699503978146,
+          "reads": 12058,
+          "end_ns": 702733559031
+        },
+        {
+          "first_issue_ns": 699504112451,
+          "reads": 12046,
+          "end_ns": 702733584932
+        }
+      ]
+    }
+  ]
+}

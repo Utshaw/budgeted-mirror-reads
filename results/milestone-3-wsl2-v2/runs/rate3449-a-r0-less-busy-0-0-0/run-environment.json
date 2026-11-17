@@ -1,0 +1,21 @@
+{
+  "origin_monotonic_ns": 299416821377,
+  "transition_ns": null,
+  "background": [
+    {
+      "file": "/mnt/d/mirror-reads-wsl2-v2/noise.dat",
+      "workers": [
+        {
+          "first_issue_ns": 299209647606,
+          "reads": 17974,
+          "end_ns": 302427137614
+        },
+        {
+          "first_issue_ns": 299209683107,
+          "reads": 17973,
+          "end_ns": 302427173213
+        }
+      ]
+    }
+  ]
+}
