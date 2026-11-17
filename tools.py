@@ -302,7 +302,7 @@ def experiment(args):
                                "repeat": repeat, "seed": args.seed, "delay_us": delay,
                                "permit_limit": cap, "threshold": threshold, **summary}
                         if columns is None:
-                            columns = csv.DictWriter(table, fieldnames=row.keys())
+                            columns = csv.DictWriter(table, fieldnames=row.keys(), lineterminator="\n")
                             columns.writeheader()
                         columns.writerow(row)
                         table.flush()

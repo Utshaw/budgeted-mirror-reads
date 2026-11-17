@@ -64,7 +64,7 @@ def compare(rows, output):
                 })
     require(bool(comparisons), "no budget comparisons found")
     with (output / "matched-comparisons.csv").open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=comparisons[0].keys())
+        writer = csv.DictWriter(stream, fieldnames=comparisons[0].keys(), lineterminator="\n")
         writer.writeheader()
         writer.writerows(comparisons)
     return by_run, comparisons

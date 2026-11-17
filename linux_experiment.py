@@ -93,7 +93,7 @@ class Noise:
 
 def write_table(path, rows):
     with path.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+        writer = csv.DictWriter(stream, fieldnames=rows[0].keys(), lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -269,7 +269,7 @@ def experiment(args):
                            "threshold": threshold, "offered_reads_per_sec": rate,
                            "trace_sha256": trace_hash, "transition_ns": transition, **metrics}
                     if writer is None:
-                        writer = csv.DictWriter(stream, fieldnames=row.keys())
+                        writer = csv.DictWriter(stream, fieldnames=row.keys(), lineterminator="\n")
                         writer.writeheader()
                     writer.writerow(row)
                     stream.flush()

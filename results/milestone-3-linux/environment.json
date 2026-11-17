@@ -1,0 +1,58 @@
+{
+  "kernel": "Linux 7.0.0-43-generic x86_64 GNU/Linux",
+  "drives": [
+    {
+      "source": "/dev/sda2",
+      "parent": "sda",
+      "drive": "disk    1 WDC WD10EZEX-75WN4A0 sata",
+      "filesystem": "ntfs3"
+    },
+    {
+      "source": "/dev/sdb2",
+      "parent": "sdb",
+      "drive": "disk    1 WDC WD10EZEX-75WN4A0 sata",
+      "filesystem": "ntfs3"
+    }
+  ],
+  "replica_sha256": "4f6b51785f185b74a875e76fbd35dd69103dd7ea6531e3d09fbcb7d545ff9161",
+  "files": {
+    "/media/storagesystems/D6CAB02ECAB00CAD/csc720-milestone3-linux/mirror.dat": 536870912,
+    "/media/storagesystems/20AEB668AEB6365E/csc720-milestone3-linux/mirror.dat": 536870912,
+    "/media/storagesystems/D6CAB02ECAB00CAD/csc720-milestone3-linux/noise.dat": 536870912,
+    "/media/storagesystems/20AEB668AEB6365E/csc720-milestone3-linux/noise.dat": 536870912
+  },
+  "rates": [
+    116,
+    231
+  ],
+  "candidate_delays_us": [
+    7135,
+    9214,
+    9847
+  ],
+  "selected_delay_us": 9214,
+  "delay_rule": "p90 of the independent moderate-load less-busy calibration",
+  "seconds": 3,
+  "repeats": 3,
+  "seed": 720,
+  "logical_depth": 8,
+  "physical_depth": 32,
+  "noise_depth_per_drive": 2,
+  "permit_counts": [
+    1,
+    2,
+    4
+  ],
+  "threshold": 1,
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "cache_protocol": "4 KiB O_DIRECT for all reads, identical traces and noise warmup; device caches left enabled"
+}

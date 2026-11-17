@@ -8,7 +8,7 @@ Open PowerShell and start Ubuntu with this command.
 
     wsl -d Ubuntu-24.04
 
-In Ubuntu, run the following commands. The source is on the Windows Desktop and the smoke-test files are created temporarily on Ubuntu's ext4 filesystem.
+In Ubuntu, run these commands from your checkout. The smoke tests create temporary files under Ubuntu's `/var/tmp`.
 
     cd /path/to/budgeted-mirror-reads
     make
